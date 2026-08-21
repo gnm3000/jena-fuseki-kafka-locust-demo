@@ -35,6 +35,100 @@ Apache Kafka topic: rdf-events
 - `locust`: custom `uv`-built image with the Python load test code and Kafka client.
 - `kafka-ui`: Kafka topic/consumer inspection UI.
 
+## RDF And Ontology Model
+
+This demo uses RDF because the data is naturally represented as a graph: a request belongs to a tenant, is served by a service, has a timestamp, has a status code, and has a measured latency. RDF stores those facts as triples:
+
+```text
+subject              predicate              object
+demo:request/abc123  rdf:type               demo:Request
+demo:request/abc123  demo:servedBy          demo:checkout
+demo:request/abc123  demo:belongsToTenant   demo:tenant-a
+demo:request/abc123  demo:createdAt         "2026-08-21T22:49:32.123Z"^^xsd:dateTime
+demo:request/abc123  demo:statusCode        "200"^^xsd:integer
+demo:request/abc123  demo:latencyMs         "41.7"^^xsd:decimal
+```
+
+Kafka messages are encoded as **N-Quads**, not plain Turtle. N-Quads adds a fourth term: the graph name. This demo writes all generated operational data into the named graph `https://revsavvy.ai/demo#graph/load`. That is why the SPARQL queries use `GRAPH ?g { ... }` instead of reading only the default graph.
+
+### Ontology
+
+The ontology lives in `ontology/demo.ttl`. It defines a small domain model:
+
+- `demo:Request`: one observed application/API request.
+- `demo:Service`: an application service that handled a request.
+- `demo:Tenant`: a customer/account namespace that owns the request.
+- `demo:servedBy`: links a request to the service that handled it.
+- `demo:belongsToTenant`: links a request to the tenant.
+- `demo:createdAt`: timestamp for the request.
+- `demo:statusCode`: simulated HTTP status code.
+- `demo:latencyMs`: simulated request latency.
+
+The ontology file also includes a few seed individuals, such as `demo:checkout`, `demo:catalog`, and `demo:tenant-a`, mainly to make the model concrete. The load generator can emit more service and tenant IRIs than those seed examples. Each generated event includes type triples for the selected service and tenant, so the graph remains self-describing even when `pricing`, `search`, `tenant-b`, or `tenant-c` appear.
+
+### What The Writer Simulates
+
+Each Python/Locust write simulates one request event from an operational system. The generator randomly chooses:
+
+- one service from `checkout`, `catalog`, `pricing`, `search`;
+- one tenant from `tenant-a`, `tenant-b`, `tenant-c`;
+- one status code, usually `200`, with occasional `429`, `500`, or `503`;
+- one latency value between roughly `10 ms` and `260 ms`;
+- one timestamp at write time.
+
+For every simulated request, the writer emits about 8 RDF statements:
+
+- the request is a `demo:Request`;
+- the request was served by one service;
+- the request belongs to one tenant;
+- the request has `createdAt`, `statusCode`, and `latencyMs` literals;
+- the selected service is typed as `demo:Service`;
+- the selected tenant is typed as `demo:Tenant`;
+- about 1% of events also get `demo:sampled true`.
+
+So after `N` generated request events, the dataset should contain approximately `N` request nodes plus a small bounded set of reusable service and tenant nodes. In the measured scaled test, the final count was `2,245` request nodes, and each of the 4 Fuseki readers replayed Kafka up to offset `2,245`.
+
+### What Nodes Should Exist
+
+After a small run, the graph should contain these kinds of RDF resources:
+
+- request nodes: many unique IRIs like `demo:request/<uuid>`, one per generated event;
+- service nodes: up to 4 stable IRIs, `demo:checkout`, `demo:catalog`, `demo:pricing`, `demo:search`;
+- tenant nodes: up to 3 stable IRIs, `demo:tenant-a`, `demo:tenant-b`, `demo:tenant-c`;
+- the named graph node: `demo:graph/load`, used as the N-Quads graph target.
+
+The important scaling behavior is that every reader should converge to the same request count, because every reader consumes the full Kafka topic through its own consumer group. If one reader has fewer request nodes, it is behind Kafka or was misconfigured to share a consumer group.
+
+### What The Read Load Simulates
+
+The Locust read users simulate dashboard/reporting traffic over SPARQL:
+
+```sparql
+PREFIX demo: <https://revsavvy.ai/demo#>
+SELECT (COUNT(?request) AS ?requests)
+WHERE { GRAPH ?g { ?request a demo:Request . } }
+```
+
+This query answers: "how many request events have been replicated into this reader?" It is the main correctness check.
+
+```sparql
+PREFIX demo: <https://revsavvy.ai/demo#>
+SELECT ?service (COUNT(?request) AS ?requests)
+WHERE {
+  GRAPH ?g {
+    ?request a demo:Request ;
+             demo:servedBy ?service .
+  }
+}
+GROUP BY ?service
+ORDER BY DESC(?requests)
+LIMIT 10
+```
+
+This query answers: "which services are receiving the most requests?" It is a simple analytical query that exercises grouping and aggregation over the RDF graph.
+
+The write load tests Kafka ingestion and TDB2 projection. The read load tests Nginx distribution and Fuseki/TDB2 query performance. Together they show the intended pattern: writes go to Kafka once, every reader builds its own local graph, and reads scale horizontally by adding more Fuseki replicas.
+
 ## Why Kafka Is Configured This Way
 
 The demo now uses the standard official Kafka image instead of `apache/kafka-native`, but keeps resource usage low:
