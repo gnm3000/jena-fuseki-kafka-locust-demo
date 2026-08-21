@@ -17,13 +17,13 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "rdf-events")
 DATASET_PATH = os.getenv("DATASET_PATH", "/ds")
 
 COUNT_QUERY = """
-PREFIX demo: <https://revsavvy.ai/demo#>
+PREFIX demo: <https://example.org/jena-demo#>
 SELECT (COUNT(?request) AS ?requests)
 WHERE { GRAPH ?g { ?request a demo:Request . } }
 """
 
 SERVICE_QUERY = """
-PREFIX demo: <https://revsavvy.ai/demo#>
+PREFIX demo: <https://example.org/jena-demo#>
 SELECT ?service (COUNT(?request) AS ?requests)
 WHERE {
   GRAPH ?g {

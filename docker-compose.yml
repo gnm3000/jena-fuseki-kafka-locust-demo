@@ -54,7 +54,7 @@ services:
       args:
         JENA_VERSION: "6.2.0"
         FUSEKI_KAFKA_VERSION: "3.1.0"
-    image: revsavvy/jena-fuseki-kafka:6.2.0-3.1.0
+    image: jena-fuseki-kafka-demo:6.2.0-3.1.0
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -88,7 +88,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.locust
-    image: revsavvy/jena-locust:0.1.0
+    image: jena-locust-demo:0.1.0
     depends_on:
       nginx-read:
         condition: service_healthy

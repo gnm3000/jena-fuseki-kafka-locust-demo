@@ -49,7 +49,7 @@ demo:request/abc123  demo:statusCode        "200"^^xsd:integer
 demo:request/abc123  demo:latencyMs         "41.7"^^xsd:decimal
 ```
 
-Kafka messages are encoded as **N-Quads**, not plain Turtle. N-Quads adds a fourth term: the graph name. This demo writes all generated operational data into the named graph `https://revsavvy.ai/demo#graph/load`. That is why the SPARQL queries use `GRAPH ?g { ... }` instead of reading only the default graph.
+Kafka messages are encoded as **N-Quads**, not plain Turtle. N-Quads adds a fourth term: the graph name. This demo writes all generated operational data into the named graph `https://example.org/jena-demo#graph/load`. That is why the SPARQL queries use `GRAPH ?g { ... }` instead of reading only the default graph.
 
 ### Ontology
 
@@ -104,7 +104,7 @@ The important scaling behavior is that every reader should converge to the same 
 The Locust read users simulate dashboard/reporting traffic over SPARQL:
 
 ```sparql
-PREFIX demo: <https://revsavvy.ai/demo#>
+PREFIX demo: <https://example.org/jena-demo#>
 SELECT (COUNT(?request) AS ?requests)
 WHERE { GRAPH ?g { ?request a demo:Request . } }
 ```
@@ -112,7 +112,7 @@ WHERE { GRAPH ?g { ?request a demo:Request . } }
 This query answers: "how many request events have been replicated into this reader?" It is the main correctness check.
 
 ```sparql
-PREFIX demo: <https://revsavvy.ai/demo#>
+PREFIX demo: <https://example.org/jena-demo#>
 SELECT ?service (COUNT(?request) AS ?requests)
 WHERE {
   GRAPH ?g {

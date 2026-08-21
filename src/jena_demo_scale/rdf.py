@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from random import choice, randint, random
 from uuid import uuid4
 
-DEMO = "https://revsavvy.ai/demo#"
+DEMO = "https://example.org/jena-demo#"
 SERVICES = ("checkout", "catalog", "pricing", "search")
 TENANTS = ("tenant-a", "tenant-b", "tenant-c")
 

@@ -6,7 +6,7 @@ import time
 import requests
 
 COUNT_QUERY = """
-PREFIX demo: <https://revsavvy.ai/demo#>
+PREFIX demo: <https://example.org/jena-demo#>
 SELECT (COUNT(?request) AS ?requests)
 WHERE { GRAPH ?g { ?request a demo:Request . } }
 """
