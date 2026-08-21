@@ -1,0 +1,47 @@
+@prefix demo: <https://revsavvy.ai/demo#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+demo: a owl:Ontology ;
+    rdfs:label "Jena TDB2 Kafka scale demo ontology" ;
+    rdfs:comment "Simple ontology for load-testing Kafka-fed Jena Fuseki readers backed by TDB2." .
+
+demo:Tenant a owl:Class ;
+    rdfs:label "Tenant" .
+
+demo:Request a owl:Class ;
+    rdfs:label "Request" .
+
+demo:Service a owl:Class ;
+    rdfs:label "Service" .
+
+demo:servedBy a owl:ObjectProperty ;
+    rdfs:domain demo:Request ;
+    rdfs:range demo:Service .
+
+demo:belongsToTenant a owl:ObjectProperty ;
+    rdfs:domain demo:Request ;
+    rdfs:range demo:Tenant .
+
+demo:createdAt a owl:DatatypeProperty ;
+    rdfs:domain demo:Request ;
+    rdfs:range xsd:dateTime .
+
+demo:latencyMs a owl:DatatypeProperty ;
+    rdfs:domain demo:Request ;
+    rdfs:range xsd:decimal .
+
+demo:statusCode a owl:DatatypeProperty ;
+    rdfs:domain demo:Request ;
+    rdfs:range xsd:integer .
+
+demo:checkout a demo:Service ;
+    rdfs:label "checkout" .
+
+demo:catalog a demo:Service ;
+    rdfs:label "catalog" .
+
+demo:tenant-a a demo:Tenant ;
+    rdfs:label "tenant-a" .

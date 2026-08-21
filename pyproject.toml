@@ -1,0 +1,23 @@
+[project]
+name = "jena-demo-scale"
+version = "0.1.0"
+description = "Apache Jena TDB2 scale demo with Kafka replication and Locust load testing"
+readme = "README.md"
+authors = [
+    { name = "German Montenegro", email = "gnm3000@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "confluent-kafka>=2.11.1",
+    "locust>=2.37.10",
+    "requests>=2.32.5",
+]
+
+[project.scripts]
+jena-demo-scale = "jena_demo_scale:main"
+jena-demo-produce = "jena_demo_scale.producer:main"
+jena-demo-stats = "jena_demo_scale.stats:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
