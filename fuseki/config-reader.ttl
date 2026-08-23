@@ -1,13 +1,16 @@
 PREFIX :       <#>
 PREFIX fuseki: <http://jena.apache.org/fuseki#>
-PREFIX fk:     <http://jena.apache.org/fuseki/kafka#>
-PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
 PREFIX rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX tdb2:   <http://jena.apache.org/2016/tdb#>
+PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
+PREFIX delta:  <http://jena.apache.org/rdf-delta#>
 
 [] rdf:type fuseki:Server ;
    fuseki:services ( :service ) .
 
+## Read-only follower: no update/gsp-rw endpoint is exposed, so this
+## instance can never accept a write. It syncs from the RDF Delta patch
+## log on every request that needs the latest version, using its own
+## local zone directory (never shared between replicas).
 :service rdf:type fuseki:Service ;
     fuseki:name "ds" ;
     fuseki:endpoint [
@@ -20,22 +23,12 @@ PREFIX tdb2:   <http://jena.apache.org/2016/tdb#>
     ] ;
     fuseki:dataset :dataset .
 
-:dataset rdf:type tdb2:DatasetTDB2 ;
-    tdb2:location "/fuseki/databases/tdb2" ;
+:dataset rdf:type delta:DeltaDataset ;
+    delta:changes  "http://delta-server:1066/" ;
+    delta:patchlog "rdf-events" ;
+    delta:zone     "/fuseki/zone" ;
+    delta:storage  "tdb2" ;
     ja:context [
         ja:cxtName "arq:queryTimeout" ;
         ja:cxtValue "30000,120000"
     ] .
-
-:connector rdf:type fk:Connector ;
-    fk:topic "env:{ENV_KAFKA_TOPIC:rdf-events}" ;
-    fk:fusekiServiceName "/ds" ;
-    fk:bootstrapServers "env:{ENV_KAFKA_BOOTSTRAP_SERVERS:kafka:29092}" ;
-    fk:stateFile "/fuseki/state/rdf-events.state" ;
-    fk:groupId "env:{ENV_FUSEKI_GROUP_ID}" ;
-    fk:syncTopic true ;
-    fk:dlqTopic "env:{ENV_KAFKA_DLQ_TOPIC:rdf-events.dlq}" ;
-    fk:config ( "max.poll.records" "1000" ) ,
-              ( "auto.offset.reset" "earliest" ) ,
-              ( "fuseki.kafka.batch.size" "1000" ) ,
-              ( "fuseki.kafka.batch.size.bytes" "52428800" ) .

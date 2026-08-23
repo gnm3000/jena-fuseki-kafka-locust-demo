@@ -5,8 +5,8 @@
 @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
 
 demo: a owl:Ontology ;
-    rdfs:label "Jena TDB2 Kafka scale demo ontology" ;
-    rdfs:comment "Simple ontology for load-testing Kafka-fed Jena Fuseki readers backed by TDB2." .
+    rdfs:label "Jena TDB2 scale demo ontology" ;
+    rdfs:comment "Simple ontology for load-testing RDF Delta-replicated Jena Fuseki readers backed by TDB2." .
 
 demo:Tenant a owl:Class ;
     rdfs:label "Tenant" .

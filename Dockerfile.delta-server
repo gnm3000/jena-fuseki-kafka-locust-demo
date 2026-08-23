@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+
+# See Dockerfile.fuseki for why this is built from a pinned commit rather
+# than a Maven Central release.
+ARG RDF_DELTA_REF=0a44c60368c523361fd2ba1d929023e5f1987ee0
+
+FROM maven:3.9.11-eclipse-temurin-21 AS build
+ARG RDF_DELTA_REF
+
+WORKDIR /build
+RUN git clone --quiet https://github.com/afs/rdf-delta.git . \
+    && git checkout --quiet "${RDF_DELTA_REF}"
+
+RUN --mount=type=cache,target=/root/.m2,sharing=locked \
+    mvn -q -DskipTests -pl rdf-delta-server -am install
+
+FROM eclipse-temurin:21-jre-jammy AS delta-server
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends tini
+
+COPY --from=build /build/rdf-delta-server/target/rdf-delta-server-*.jar /delta/delta-server.jar
+
+RUN mkdir -p /delta/store \
+    && groupadd --system --gid 10002 delta \
+    && useradd --system --uid 10002 --gid delta --home-dir /delta delta \
+    && chown -R delta:delta /delta
+
+USER delta
+WORKDIR /delta
+EXPOSE 1066
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=6 \
+    CMD java -cp delta-server.jar dcmd ls --server http://127.0.0.1:1066/ >/dev/null 2>&1 || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "java", "-jar", "/delta/delta-server.jar"]
+CMD ["--port", "1066", "--base", "/delta/store"]

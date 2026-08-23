@@ -1,14 +1,13 @@
 [project]
 name = "jena-demo-scale"
 version = "0.1.0"
-description = "Apache Jena TDB2 scale demo with Kafka replication and Locust load testing"
+description = "Apache Jena TDB2 scale demo with RDF Delta replication and Locust load testing"
 readme = "README.md"
 authors = [
     { name = "German Montenegro", email = "gnm3000@gmail.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "confluent-kafka>=2.11.1",
     "flask>=3.1.0",
     "locust>=2.37.10",
     "rdflib>=7.1.1",

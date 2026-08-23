@@ -12,7 +12,7 @@ from .rdf import event_nquads
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Produce RDF N-Quads write events through the write gateway, "
-        "which commits them to the writer's TDB2 before replicating via Kafka."
+        "which commits them to the writer's TDB2 before RDF Delta replicates them to readers."
     )
     parser.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://localhost:8081"))
     parser.add_argument("--events", type=int, default=1000)

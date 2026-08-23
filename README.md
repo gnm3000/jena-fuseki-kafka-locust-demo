@@ -1,8 +1,10 @@
-# Jena TDB2 Primary/Replica Scaling Demo (Kafka-Replicated)
+# Jena TDB2 Primary/Replica Scaling Demo (RDF Delta Replicated)
 
-This project demonstrates a realistic Apache Jena Fuseki + TDB2 scaling pattern using **the primary's TDB2 dataset as the source of truth**, Kafka as the durable replication transport to read replicas, and Locust as the load generator.
+This project demonstrates a realistic Apache Jena Fuseki + TDB2 scaling pattern using **the primary's TDB2 dataset as the source of truth**, [RDF Delta](https://afs.github.io/rdf-delta) as the durable replication transport to read replicas, and Locust as the load generator.
 
-The key architectural point is that **TDB2 is not a distributed database**: it has no built-in primary/replica streaming replication the way Postgres or MySQL do. This demo gets primary/replica semantics anyway by putting a single authoritative Fuseki+TDB2 **writer** in front of all writes, and using Kafka purely as the transport that ships the writer's committed changes out to independent **reader** replicas, each with its own local TDB2 store.
+The key architectural point is that **TDB2 is not a distributed database**: it has no built-in primary/replica streaming replication the way Postgres or MySQL do. This demo gets primary/replica semantics anyway by putting a single authoritative Fuseki+TDB2 **writer** in front of all writes, and using an RDF Delta Patch Log Server as the transport that ships the writer's committed changes out to independent **reader** replicas, each with its own local TDB2 store.
+
+An earlier version of this demo used Kafka for that transport instead. RDF Delta replaces it here because it is purpose-built for exactly this job (patch-log shipping between Fuseki instances) and needs far less infrastructure — no broker cluster, no ZooKeeper, no partitions or consumer groups. See [Why RDF Delta Instead Of Kafka](#why-rdf-delta-instead-of-kafka) for the trade-offs and a real caveat about that project's maintenance status.
 
 ## Architecture
 
@@ -12,15 +14,19 @@ Locust / Python writers
         v
 +-------------------+     synchronous commit      +--------------------+
 |   write-gateway    | ---------------------------> |   fuseki-writer    |
-| (commit gate)      | <--- 200 OK only on commit -- | TDB2 (source of    |
-+-------------------+                               | truth)             |
-        |                                            +--------------------+
-        | only published after the writer commits
-        v
-Apache Kafka topic: rdf-events   (replication transport, not the source of truth)
-        |
-        | each Fuseki reader uses a unique Kafka consumer group
-        v
+| (commit gate)      | <--- 200 OK only when the --- | TDB2 + RDF Delta   |
++-------------------+      patch is durable in       | client (source of  |
+                           the patch log              | truth)             |
+                                                       +--------------------+
+                                                                |
+                                                                | patch committed
+                                                                v
+                                              RDF Delta Patch Log Server (delta-server)
+                                                     patch log: "rdf-events"
+                                                                |
+                                                                | each reader syncs its own
+                                                                | local zone on every request
+                                                                v
 +----------------+   +----------------+   +----------------+   +----------------+
 | Fuseki reader  |   | Fuseki reader  |   | Fuseki reader  |   | Fuseki reader  |
 | local TDB2     |   | local TDB2     |   | local TDB2     |   | local TDB2     |
@@ -34,28 +40,29 @@ Apache Kafka topic: rdf-events   (replication transport, not the source of truth
                          SPARQL reads on localhost:8080
 ```
 
-### Write path: the DB is the durability gate
+### Write path: the DB (and its replication log) is the durability gate
 
-The `write-gateway` is the only write entry point. For every incoming event it:
+`fuseki-writer`'s dataset is an RDF Delta `delta:DeltaDataset`, not a plain `tdb2:DatasetTDB2`. That changes what "committed" means: Fuseki does **not** consider a SPARQL Update transaction committed until the corresponding RDF Patch has been durably recorded in the RDF Delta patch log. The local TDB2 write and the patch-log append happen as one logical unit inside Fuseki itself — the `write-gateway` doesn't have to orchestrate that two-step process by hand the way the earlier Kafka-based version did.
 
-1. Converts the N-Quads payload into a SPARQL `INSERT DATA` and sends it to `fuseki-writer`'s `/ds/update` endpoint, **synchronously**, and waits for the commit to succeed.
-2. Only if that commit succeeds does it publish the same N-Quads to the `rdf-events` Kafka topic.
-3. If the Kafka publish fails after the DB commit, it returns an error to the caller rather than silently swallowing the gap. Because RDF `INSERT DATA` is naturally idempotent (inserting the same triple twice is a no-op), the caller can safely retry the same event without risk of duplication on the primary.
+So the `write-gateway`'s job is now just:
 
-This means `fuseki-writer`'s TDB2 is authoritative: if the gateway returns success, the write is durably committed in the primary, independent of whether Kafka or any reader has seen it yet. Kafka is downstream of that commit — it exists only because TDB2 itself cannot stream its own write-ahead log to followers, so this demo builds that shipping mechanism explicitly instead.
+1. Convert the incoming N-Quads into a SPARQL `INSERT DATA` update.
+2. POST it to `fuseki-writer`'s `/ds/update` endpoint and wait.
+3. Return whatever `fuseki-writer` returns: a 200 means the write is durable in **both** the primary's TDB2 and the replication log; anything else means it isn't durable anywhere.
 
-The trade-off versus the previous Kafka-as-source-of-truth design is latency: every write now pays for a synchronous round trip to the primary's TDB2 commit *and* a Kafka publish before it is acknowledged, instead of a fire-and-forget produce. That is the expected cost of moving durability from the log to the database.
+This closes a gap that existed in the Kafka version of this demo: there, the writer's TDB2 commit and the Kafka publish were two separate steps the gateway had to sequence itself, with a small window where the primary had the data but the log didn't yet. With RDF Delta, Fuseki treats "commit to TDB2" and "commit to the replication log" as a single unit — there's no separate step where they can disagree, because there's no separate step at all.
+
+The reader replicas run Fuseki with the **same** `delta:DeltaDataset` type, just pointed at a config with no update endpoint exposed (see `fuseki/config-reader.ttl`). On every request that needs the latest data, a reader checks the patch log for its current version and catches up before answering. That is why a brand-new reader replica, starting from an empty local zone, converges to the writer's full dataset without any Kafka-style "consumer group" or offset bookkeeping to configure.
 
 ## Services
 
-- `fuseki-writer`: single Fuseki 6.2.0 + TDB2 instance, the **primary**/source of truth. Accepts SPARQL Update/GSP directly; has no Kafka connector.
-- `write-gateway`: Flask/Waitress HTTP service and the only write entry point. Commits each write to `fuseki-writer` synchronously, then republishes it to Kafka for the replicas.
-- `kafka`: official `apache/kafka:4.3.1`, KRaft single-node mode, JVM heap capped at 256 MiB, container memory capped at 450 MiB. Used here purely as the writer's replication transport.
-- `kafka-init`: creates `rdf-events` and `rdf-events.dlq` explicitly.
-- `fuseki-reader`: scalable Fuseki 6.2.0 + TDB2 + Telicent Jena Fuseki Kafka module 3.1.0. Each replica is a read-only **follower** that replays `rdf-events` into its own local TDB2.
+- `fuseki-writer`: single Fuseki instance built on `delta-fuseki.jar`, the **primary**/source of truth. Only this instance exposes a SPARQL Update endpoint.
+- `write-gateway`: Flask/Waitress HTTP service and the only write entry point. Forwards each write to `fuseki-writer` synchronously and reports back exactly what the writer reports.
+- `delta-server`: the RDF Delta Patch Log Server (`delta-server.jar`), running in its simplest supported mode — a single process with plain-file patch storage (`--base`), no ZooKeeper, no S3. This is the transport; see below for why this mode specifically was chosen.
+- `delta-init`: one-shot container that creates the `rdf-events` patch log on `delta-server` if it doesn't already exist yet (idempotent, so `docker compose up` can be re-run safely).
+- `fuseki-reader`: scalable Fuseki instance, same `delta-fuseki.jar` image as the writer but a read-only config. Each replica is a **follower** that syncs from the `rdf-events` patch log into its own local TDB2-backed zone.
 - `nginx-read`: load-balances read-only SPARQL traffic across the Fuseki readers.
 - `locust`: custom `uv`-built image with the Python load test code; `WriterUser` posts to `write-gateway`, `ReaderUser` queries through `nginx-read`.
-- `kafka-ui`: Kafka topic/consumer inspection UI.
 
 ## RDF And Ontology Model
 
@@ -71,7 +78,7 @@ demo:request/abc123  demo:statusCode        "200"^^xsd:integer
 demo:request/abc123  demo:latencyMs         "41.7"^^xsd:decimal
 ```
 
-Kafka messages are encoded as **N-Quads**, not plain Turtle. N-Quads adds a fourth term: the graph name. This demo writes all generated operational data into the named graph `https://example.org/jena-demo#graph/load`. That is why the SPARQL queries use `GRAPH ?g { ... }` instead of reading only the default graph.
+Writes are sent as **N-Quads**, not plain Turtle. N-Quads adds a fourth term: the graph name. This demo writes all generated operational data into the named graph `https://example.org/jena-demo#graph/load`. That is why the SPARQL queries use `GRAPH ?g { ... }` instead of reading only the default graph.
 
 ### Ontology
 
@@ -108,7 +115,7 @@ For every simulated request, the writer emits about 8 RDF statements:
 - the selected tenant is typed as `demo:Tenant`;
 - about 1% of events also get `demo:sampled true`.
 
-So after `N` generated request events, the dataset should contain approximately `N` request nodes plus a small bounded set of reusable service and tenant nodes. In the measured scaled test, the final count was `2,245` request nodes, and each of the 4 Fuseki readers replayed Kafka up to offset `2,245`.
+So after `N` generated request events, the dataset should contain approximately `N` request nodes plus a small bounded set of reusable service and tenant nodes.
 
 ### What Nodes Should Exist
 
@@ -119,7 +126,7 @@ After a small run, the graph should contain these kinds of RDF resources:
 - tenant nodes: up to 3 stable IRIs, `demo:tenant-a`, `demo:tenant-b`, `demo:tenant-c`;
 - the named graph node: `demo:graph/load`, used as the N-Quads graph target.
 
-The important scaling behavior is that every reader should converge to the same request count as `fuseki-writer`, because every reader consumes the full Kafka topic through its own consumer group. If one reader has fewer request nodes than the writer, it is behind Kafka replication or was misconfigured to share a consumer group. The writer's own count, queried directly, is the ground truth to compare replicas against.
+The important scaling behavior is that every reader should converge to the same request count as `fuseki-writer`, because every reader syncs from the same RDF Delta patch log. If one reader has fewer request nodes than the writer, it is behind on replication. The writer's own count, queried directly, is the ground truth to compare replicas against.
 
 ### What The Read Load Simulates
 
@@ -149,38 +156,31 @@ LIMIT 10
 
 This query answers: "which services are receiving the most requests?" It is a simple analytical query that exercises grouping and aggregation over the RDF graph.
 
-The write load tests the write-gateway's synchronous commit-to-primary path and TDB2 projection into replicas. The read load tests Nginx distribution and Fuseki/TDB2 query performance. Together they show the intended pattern: writes commit to the primary once, Kafka ships that commit to every reader, and reads scale horizontally by adding more Fuseki replicas.
+The write load tests the write-gateway's synchronous commit-to-primary path, which now also includes the primary's patch-log commit. The read load tests Nginx distribution and Fuseki/TDB2 query performance. Together they show the intended pattern: writes commit to the primary (and its replication log) once, and reads scale horizontally by adding more Fuseki replicas.
 
-## Why TDB2 Needs A Primary And Kafka Needs To Exist At All
+## Why RDF Delta Instead Of Kafka
 
-TDB2 has no native primary/replica replication: no WAL shipping, no streaming replication, no cluster mode. If a single TDB2 instance is going to be the source of truth, something still has to carry its committed changes out to followers — that's what Kafka is doing here, playing the role a database's own replication log would play if TDB2 had one.
+TDB2 has no native primary/replica replication: no WAL shipping, no streaming replication, no cluster mode. Something still has to carry the primary's committed changes out to followers. [RDF Delta](https://github.com/afs/rdf-delta) is Apache Jena's own answer to that problem: an RDF Patch Log Server plus a Fuseki client module (`delta:DeltaDataset`), built by the same people who maintain Jena/TDB2/Fuseki.
 
-The demo uses the standard official Kafka image instead of `apache/kafka-native`, but keeps resource usage low:
+**A real caveat, checked directly against the project, not assumed:** the last release of RDF Delta on Maven Central (`1.1.2`, 2022) predates Jena 6 and is not what this demo uses. The maintainer, Andy Seaborne, has also stated on the Jena mailing list that the separate `rdf-delta` project will eventually be archived — the ZooKeeper-backed HA mode and the S3 patch-storage backend (whose AWS SDK v1 dependency reached end-of-life) were too much to keep maintaining as a side project. He specifically said the **plain file-backed patch server** (no ZooKeeper, no S3) will keep being supported, because it's the low-maintenance mode. That is exactly the mode this demo uses (`delta-server --base DIR`). Because of the Maven Central gap, `Dockerfile.fuseki` and `Dockerfile.delta-server` build RDF Delta from source, pinned to a specific commit (`RDF_DELTA_REF`, currently `0a44c60368c523361fd2ba1d929023e5f1987ee0`) that the upstream repo's own history confirms was made to fix warnings against Jena 6.2.0 — i.e., a commit the maintainers themselves verified against the exact Jena version this demo runs.
 
-- `KAFKA_HEAP_OPTS=-Xms256m -Xmx256m` caps the JVM heap.
-- `mem_limit: 450m` prevents the Kafka container from growing without bound.
-- KRaft mode avoids ZooKeeper entirely.
-- internal replication factors are set to `1`, which is appropriate for this single-node demo.
-- `KAFKA_NUM_PARTITIONS=1` preserves event ordering, which matters since the writer is a single serial commit stream and readers must apply patches in the same order.
-
-For real production, use a multi-broker Kafka cluster or a managed Kafka service with replication, TLS/SASL, monitoring, backups, and topic retention sized for replay/recovery requirements. The primary (`fuseki-writer`) is also a single point of failure in this demo — production would need its own failover story (standby TDB2 + promotion, or a managed/clustered triplestore), which is out of scope here.
+Given that maintenance outlook, treat this integration as **validated to work today, not a dependency to lean on indefinitely**. A from-scratch replication plugin built directly on Jena's own `RDFPatch` format (which is not going away, since it's used by Jena core independent of the separate `rdf-delta` project) remains the lower-risk long-term option; see the git history/discussion for that alternative design. Because the build pins an exact commit rather than a moving branch, this demo won't silently break if `rdf-delta` is archived or changes later — it just won't get any further upstream fixes either.
 
 ## Start The Demo
 
 ```bash
 uv sync
-docker compose build fuseki-writer write-gateway fuseki-reader locust
+docker compose build delta-server fuseki-writer write-gateway fuseki-reader locust
 docker compose up -d --scale fuseki-reader=2
 ```
+
+The first build compiles RDF Delta from source (see above), which takes a few minutes; subsequent builds reuse the BuildKit Maven cache and are fast.
 
 Endpoints:
 
 - Write gateway (the only write entry point): `http://localhost:8081/write`
 - Read-balanced SPARQL endpoint: `http://localhost:8080/ds/sparql`
 - Locust UI: `http://localhost:8089`
-- Kafka UI: `http://localhost:8090`
-- Kafka bootstrap from host: `localhost:9092`
-- Kafka bootstrap from containers: `kafka:29092`
 
 ## Produce Data Manually
 
@@ -189,7 +189,7 @@ uv run jena-demo-produce --gateway-url http://localhost:8081 --events 10000 --ra
 uv run jena-demo-stats --once
 ```
 
-`jena-demo-produce` posts RDF N-Quads events to the write gateway with `Content-Type: application/n-quads`. The gateway commits each event to `fuseki-writer`'s TDB2 synchronously, then republishes it to Kafka; the Fuseki Kafka module on each reader consumes that topic and applies the same changes to its own local TDB2 dataset.
+`jena-demo-produce` posts RDF N-Quads events to the write gateway with `Content-Type: application/n-quads`. The gateway forwards each event to `fuseki-writer`'s update endpoint; the write is not acknowledged until it is durable in both the writer's TDB2 and the RDF Delta patch log. Readers pick up the change the next time they sync.
 
 ## Run Load Tests
 
@@ -210,6 +210,8 @@ The Locust test has two user types:
 - `WriterUser`: posts RDF events to the write gateway (absolute URL, independent of `-H`/`--host`, which only applies to `ReaderUser`).
 - `ReaderUser`: sends SPARQL read queries through Nginx.
 
+Under a burst of many concurrent `WriterUser`s, expect some write latency and occasional gateway timeouts: `fuseki-writer` is a single serial committer, and every commit now also has to round-trip to `delta-server`. That backpressure is expected — it is the cost of a real single-primary source of truth, not a bug. See [Did It Scale Correctly?](#did-it-scale-correctly).
+
 ## Scaling Readers
 
 Scale from 2 readers to 4 readers:
@@ -218,79 +220,13 @@ Scale from 2 readers to 4 readers:
 docker compose up -d --scale fuseki-reader=4
 ```
 
-Every reader gets a unique Kafka `groupId`, derived from its container hostname. This is required. If all replicas share the same consumer group, Kafka partitions are divided between replicas and the replicas do **not** each receive the full dataset. With unique groups, every reader independently replays the full topic and converges to the same TDB2 state.
-
-## Test Results
-
-Environment date: 2026-08-21. **These numbers were measured under the previous architecture, where Locust/`jena-demo-produce` wrote directly to Kafka and no `fuseki-writer`/`write-gateway` existed.** They are kept for historical reference on Kafka/reader throughput; they do not reflect the added write-gateway commit latency described above. Re-run the load test against the current stack for up-to-date numbers.
-
-### Smoke Test
-
-Initial smoke test with 2 Fuseki readers:
-
-- Produced 25 RDF events with `uv run jena-demo-produce --events 25 --rate 25`.
-- SPARQL count returned `requests=25` through `http://localhost:8080/ds/sparql`.
-- Both readers consumed the topic completely with unique consumer groups.
-- Kafka memory after smoke test: about `293.4 MiB / 450 MiB`.
-
-### Short Mixed Load Test
-
-Command:
-
-```bash
-uv run locust -f locustfile.py --headless --users 4 --spawn-rate 4 --run-time 10s -H http://localhost:8080
-```
-
-Result:
-
-- Total operations: `533`.
-- Failures: `0`.
-- Kafka writes: `321` RDF events.
-- SPARQL count queries: `162`.
-- SPARQL group-by queries: `50`.
-- Aggregate throughput: `54.74 req/s`.
-- SPARQL count median latency: `12 ms`.
-- SPARQL group-by median latency: `14 ms`.
-- Kafka produce median latency: `0 ms` as measured by Locust client-side enqueue time.
-
-### Scaled Reader Test
-
-The reader tier was scaled from 2 to 4 replicas:
-
-```bash
-docker compose up -d --scale fuseki-reader=4
-```
-
-All 4 readers became healthy and each replayed the Kafka topic independently.
-
-Command:
-
-```bash
-uv run locust -f locustfile.py --headless --users 8 --spawn-rate 8 --run-time 20s -H http://localhost:8080
-```
-
-Result:
-
-- Fuseki readers: `4` healthy replicas.
-- Total operations: `2,541`.
-- Failures: `0`.
-- Kafka writes: `1,899` RDF events.
-- SPARQL count queries: `474`.
-- SPARQL group-by queries: `168`.
-- Aggregate throughput: `128.76 req/s`.
-- Kafka write throughput: `96.23 events/s`.
-- SPARQL read throughput: about `32.53 reads/s`.
-- SPARQL count median latency: `14 ms`.
-- SPARQL group-by median latency: `23 ms`.
-- Final replicated dataset count: `requests=2245`.
-- All 4 readers reached Kafka offset `rdf-events-0=2245` and reported `Completely up to date with Kafka topic(s)`.
-- Kafka memory after scaled test: about `337.9 MiB / 450 MiB`.
+There is no consumer-group configuration to get right here (unlike the earlier Kafka version). Each reader keeps its own local zone directory (`delta:zone`), which is never shared between replicas and never mounted to a host volume — a fresh reader starts with an empty zone and simply syncs from `delta-server` up to the current version on its first request. Verified directly: scaling from 2 to 4 readers mid-run, the two new replicas converged to the same request count as the writer and the existing readers with no extra configuration.
 
 ## Did It Scale Correctly?
 
-Yes for read-side horizontal scaling. The demo scales the Fuseki reader tier from 2 to 4 replicas while `fuseki-writer` remains the single authoritative primary. Each reader maintains its own TDB2 database and independently replays the same Kafka replication topic. Nginx continues serving reads through one stable endpoint while Docker Compose adds replicas.
+Yes for read-side horizontal scaling, verified end-to-end: writes through `write-gateway` land on `fuseki-writer`, and both existing and newly-scaled `fuseki-reader` replicas converge to the same count as the writer. This pattern scales the **read path** by adding Fuseki readers. It does not make TDB2 itself distributed, and the write path is intentionally single-primary: all writes commit through one `fuseki-writer` instance, which is the guarantee this design trades for (a real source-of-truth DB), at the cost of the primary being a scaling and availability bottleneck for writes.
 
-This pattern scales the **read path** by adding Fuseki readers. It does not make TDB2 itself distributed, and the write path is intentionally single-primary: all writes commit through one `fuseki-writer` instance, which is the guarantee this design trades for (a real source-of-truth DB), at the cost of the primary being a scaling and availability bottleneck for writes.
+Under concurrent load testing (8 Locust users, low wait time), a small fraction of writes hit gateway-side timeouts while the writer and patch server catch up — observed directly, not estimated. This is a real, documented characteristic of RDF Delta's single patch-server design (the upstream project has an open issue about the patch server struggling under heavy concurrent sync traffic), not something specific to this demo's code. It reinforces that this architecture buys consistency and a real source of truth at the cost of single-writer write throughput.
 
 ## Production Readiness Notes
 
@@ -298,26 +234,22 @@ This demo is production-shaped, but not a complete production deployment.
 
 What is realistic here:
 
-- `fuseki-writer`'s TDB2 is the single source of truth; the write-gateway will not acknowledge a write until it is durably committed there.
+- `fuseki-writer`'s TDB2 + RDF Delta patch log together are the source of truth; a write is acknowledged only once both are durable.
 - TDB2 is never shared between containers.
-- Kafka is the replayable replication transport that ships the primary's committed changes to followers, not the source of truth itself.
-- Each reader uses a unique consumer group.
-- Readers can be scaled horizontally.
+- The RDF Delta patch log is the replayable replication transport; new readers bootstrap from it with no manual offset/group configuration.
+- Readers can be scaled horizontally with zero replication config beyond pointing at the same patch log.
 - Read traffic is load-balanced through Nginx.
-- Kafka has explicit topics and a DLQ topic.
-- Fuseki runs as a non-root user in the custom image.
-- Dockerfile builds use BuildKit cache mounts for Maven, APT, Fuseki downloads, and `uv`.
+- Fuseki and the patch server both run as non-root users in their custom images.
+- Dockerfile builds use BuildKit cache mounts for Maven and APT.
 
 What must be added for production:
 
 - failover for `fuseki-writer` itself: it is a single point of failure for writes in this demo (standby TDB2 + promotion, or a managed/clustered triplestore);
-- true durability across the commit-then-publish gap: the writer commit and the Kafka publish are two separate steps, not one atomic transaction (a transactional outbox or WAL-tailing approach would close this gap; this demo accepts it and relies on retry + RDF's insert idempotency instead);
-- multi-broker Kafka or managed Kafka, not a single broker;
-- TLS/SASL and ACLs for Kafka;
+- failover for `delta-server` itself: this demo intentionally runs the single-process, no-ZooKeeper mode (the mode the RDF Delta maintainer says will keep being supported), which means the patch server is also a single point of failure — RDF Delta does support a ZooKeeper-backed HA mode for the patch log index, but per the maintainer's own account it is the harder-to-maintain, higher-risk option, so it was deliberately left out here;
+- a decision on the RDF Delta maintenance risk described above before relying on this in a real system: either accept the pinned-commit build as-is, or replace it with a from-scratch plugin built on Jena's own `RDFPatch` format;
 - authentication/authorization in front of the write gateway and SPARQL endpoints;
-- persistent storage strategy for every Fuseki reader and for the writer;
-- topic retention sized to allow full replay for new replicas;
-- monitoring for consumer lag, DLQ volume, query latency, JVM memory, and disk growth;
-- backup/restore strategy for Kafka and TDB2 snapshots (writer and readers);
+- persistent storage strategy for the patch server's store and for the writer's zone (both are on named Docker volumes here, which is a start, not a full backup story);
+- monitoring for patch-log lag, sync latency, query latency, JVM memory, and disk growth;
+- backup/restore strategy for the patch store and TDB2 snapshots (writer and readers);
 - separate write and read network paths;
 - stricter query timeouts and result limits for untrusted clients.
