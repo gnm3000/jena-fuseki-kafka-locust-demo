@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+
+ARG JENA_VERSION=6.2.0
+ARG FUSEKI_KAFKA_VERSION=3.1.0
+
+FROM maven:3.9.11-eclipse-temurin-21 AS deps
+ARG FUSEKI_KAFKA_VERSION
+
+WORKDIR /build
+RUN printf '%s\n' \
+    '<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">' \
+    '  <modelVersion>4.0.0</modelVersion>' \
+    '  <groupId>local.demo</groupId>' \
+    '  <artifactId>fuseki-kafka-runtime</artifactId>' \
+    '  <version>1.0.0</version>' \
+    '  <dependencies>' \
+    '    <dependency>' \
+    '      <groupId>io.telicent.jena</groupId>' \
+    '      <artifactId>jena-fuseki-kafka-module</artifactId>' \
+    "      <version>${FUSEKI_KAFKA_VERSION}</version>" \
+    '    </dependency>' \
+    '  </dependencies>' \
+    '</project>' > pom.xml
+RUN --mount=type=cache,target=/root/.m2,sharing=locked \
+    mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
+      -DincludeScope=runtime \
+      -DoutputDirectory=/build/lib
+
+FROM eclipse-temurin:21-jre-jammy AS fuseki
+ARG JENA_VERSION
+
+ENV FUSEKI_HOME=/opt/fuseki \
+    FUSEKI_BASE=/fuseki \
+    JAVA_OPTIONS="-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC"
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini
+
+WORKDIR /tmp
+RUN --mount=type=cache,target=/var/cache/fuseki-downloads,sharing=locked \
+    curl -fsSL "https://downloads.apache.org/jena/binaries/apache-jena-fuseki-${JENA_VERSION}.tar.gz" \
+      -o "/var/cache/fuseki-downloads/apache-jena-fuseki-${JENA_VERSION}.tar.gz" \
+    && curl -fsSL "https://downloads.apache.org/jena/binaries/apache-jena-fuseki-${JENA_VERSION}.tar.gz.sha512" \
+      -o "/var/cache/fuseki-downloads/apache-jena-fuseki-${JENA_VERSION}.tar.gz.sha512" \
+    && cp "/var/cache/fuseki-downloads/apache-jena-fuseki-${JENA_VERSION}.tar.gz" . \
+    && cp "/var/cache/fuseki-downloads/apache-jena-fuseki-${JENA_VERSION}.tar.gz.sha512" . \
+    && sha512sum -c "apache-jena-fuseki-${JENA_VERSION}.tar.gz.sha512" \
+    && mkdir -p "${FUSEKI_HOME}" "${FUSEKI_BASE}/databases" "${FUSEKI_BASE}/config" "${FUSEKI_BASE}/state" \
+    && tar -xzf "apache-jena-fuseki-${JENA_VERSION}.tar.gz" --strip-components=1 -C "${FUSEKI_HOME}" \
+    && rm -f "apache-jena-fuseki-${JENA_VERSION}.tar.gz"*
+
+COPY --from=deps /build/lib/*.jar /fuseki/extra/
+COPY docker/fuseki/entrypoint.sh /usr/local/bin/fuseki-entrypoint
+
+RUN chmod +x /usr/local/bin/fuseki-entrypoint \
+    && groupadd --system --gid 10001 fuseki \
+    && useradd --system --uid 10001 --gid fuseki --home-dir "${FUSEKI_BASE}" fuseki \
+    && chown -R fuseki:fuseki "${FUSEKI_HOME}" "${FUSEKI_BASE}"
+
+USER fuseki
+WORKDIR ${FUSEKI_BASE}
+EXPOSE 3030
+HEALTHCHECK --interval=20s --timeout=5s --start-period=45s --retries=6 \
+    CMD curl -fsS 'http://127.0.0.1:3030/$/ping' >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "fuseki-entrypoint"]
+CMD ["--conf", "/fuseki/config/config.ttl"]
