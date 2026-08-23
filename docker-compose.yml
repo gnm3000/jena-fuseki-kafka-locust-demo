@@ -51,6 +51,42 @@ services:
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic "$${KAFKA_DLQ_TOPIC}" --partitions 1 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --describe --topic "$${KAFKA_TOPIC}"
 
+  fuseki-writer:
+    build:
+      context: .
+      dockerfile: Dockerfile.fuseki
+      args:
+        JENA_VERSION: ${JENA_VERSION:-6.2.0}
+        FUSEKI_KAFKA_VERSION: ${FUSEKI_KAFKA_VERSION:-3.1.0}
+    image: jena-fuseki-kafka-demo:${JENA_VERSION:-6.2.0}-${FUSEKI_KAFKA_VERSION:-3.1.0}
+    restart: unless-stopped
+    environment:
+      JAVA_OPTIONS: "${FUSEKI_WRITER_JAVA_OPTIONS:--Xms512m -Xmx1536m -XX:+ExitOnOutOfMemoryError -Duser.timezone=UTC}"
+    volumes:
+      - ./fuseki/config-writer.ttl:/fuseki/config/config.ttl:ro
+      - fuseki-writer-db:/fuseki/databases
+    expose:
+      - "3030"
+    mem_limit: ${FUSEKI_MEM_LIMIT:-2g}
+
+  write-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: jena-write-gateway-demo:0.1.0
+    restart: unless-stopped
+    depends_on:
+      fuseki-writer:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      WRITER_BASE_URL: http://fuseki-writer:3030/ds
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-rdf-events}
+    ports:
+      - "${GATEWAY_HOST_PORT:-8081}:8081"
+
   fuseki-reader:
     build:
       context: .
@@ -100,12 +136,12 @@ services:
     depends_on:
       nginx-read:
         condition: service_healthy
+      write-gateway:
+        condition: service_healthy
     ports:
       - "${LOCUST_HOST_PORT:-8089}:8089"
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: ${KAFKA_TOPIC:-rdf-events}
-      READ_BASE_URL: http://nginx-read
+      WRITE_BASE_URL: http://write-gateway:8081
       DATASET_PATH: /ds
     command: ["-f", "/app/locustfile.py", "--host", "http://nginx-read"]
 
@@ -123,3 +159,4 @@ services:
 
 volumes:
   kafka-data:
+  fuseki-writer-db:

@@ -9,14 +9,18 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "confluent-kafka>=2.11.1",
+    "flask>=3.1.0",
     "locust>=2.37.10",
+    "rdflib>=7.1.1",
     "requests>=2.32.5",
+    "waitress>=3.0.2",
 ]
 
 [project.scripts]
 jena-demo-scale = "jena_demo_scale:main"
 jena-demo-produce = "jena_demo_scale.producer:main"
 jena-demo-stats = "jena_demo_scale.stats:main"
+jena-demo-write-gateway = "jena_demo_scale.gateway:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

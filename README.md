@@ -1,22 +1,30 @@
-# Jena TDB2 + Kafka Horizontal Read Scaling Demo
+# Jena TDB2 Primary/Replica Scaling Demo (Kafka-Replicated)
 
-This project demonstrates a realistic Apache Jena Fuseki + TDB2 scaling pattern using Kafka as the write-ahead event log and Locust as the load generator.
+This project demonstrates a realistic Apache Jena Fuseki + TDB2 scaling pattern using **the primary's TDB2 dataset as the source of truth**, Kafka as the durable replication transport to read replicas, and Locust as the load generator.
 
-The key architectural point is that **TDB2 is not a distributed database**. A TDB2 dataset directory must be owned by one Fuseki process. Horizontal scaling is achieved by running multiple independent Fuseki reader replicas, each with its own local TDB2 store, and replaying the same RDF event stream from Kafka into every replica.
+The key architectural point is that **TDB2 is not a distributed database**: it has no built-in primary/replica streaming replication the way Postgres or MySQL do. This demo gets primary/replica semantics anyway by putting a single authoritative Fuseki+TDB2 **writer** in front of all writes, and using Kafka purely as the transport that ships the writer's committed changes out to independent **reader** replicas, each with its own local TDB2 store.
 
 ## Architecture
 
 ```text
-Python / Locust writers
+Locust / Python writers
         |
         v
-Apache Kafka topic: rdf-events
++-------------------+     synchronous commit      +--------------------+
+|   write-gateway    | ---------------------------> |   fuseki-writer    |
+| (commit gate)      | <--- 200 OK only on commit -- | TDB2 (source of    |
++-------------------+                               | truth)             |
+        |                                            +--------------------+
+        | only published after the writer commits
+        v
+Apache Kafka topic: rdf-events   (replication transport, not the source of truth)
         |
         | each Fuseki reader uses a unique Kafka consumer group
         v
 +----------------+   +----------------+   +----------------+   +----------------+
 | Fuseki reader  |   | Fuseki reader  |   | Fuseki reader  |   | Fuseki reader  |
 | local TDB2     |   | local TDB2     |   | local TDB2     |   | local TDB2     |
+| (follower)     |   | (follower)     |   | (follower)     |   | (follower)     |
 +----------------+   +----------------+   +----------------+   +----------------+
         ^                    ^                    ^                    ^
         |                    |                    |                    |
@@ -26,13 +34,27 @@ Apache Kafka topic: rdf-events
                          SPARQL reads on localhost:8080
 ```
 
+### Write path: the DB is the durability gate
+
+The `write-gateway` is the only write entry point. For every incoming event it:
+
+1. Converts the N-Quads payload into a SPARQL `INSERT DATA` and sends it to `fuseki-writer`'s `/ds/update` endpoint, **synchronously**, and waits for the commit to succeed.
+2. Only if that commit succeeds does it publish the same N-Quads to the `rdf-events` Kafka topic.
+3. If the Kafka publish fails after the DB commit, it returns an error to the caller rather than silently swallowing the gap. Because RDF `INSERT DATA` is naturally idempotent (inserting the same triple twice is a no-op), the caller can safely retry the same event without risk of duplication on the primary.
+
+This means `fuseki-writer`'s TDB2 is authoritative: if the gateway returns success, the write is durably committed in the primary, independent of whether Kafka or any reader has seen it yet. Kafka is downstream of that commit — it exists only because TDB2 itself cannot stream its own write-ahead log to followers, so this demo builds that shipping mechanism explicitly instead.
+
+The trade-off versus the previous Kafka-as-source-of-truth design is latency: every write now pays for a synchronous round trip to the primary's TDB2 commit *and* a Kafka publish before it is acknowledged, instead of a fire-and-forget produce. That is the expected cost of moving durability from the log to the database.
+
 ## Services
 
-- `kafka`: official `apache/kafka:4.3.1`, KRaft single-node mode, JVM heap capped at 256 MiB, container memory capped at 450 MiB.
+- `fuseki-writer`: single Fuseki 6.2.0 + TDB2 instance, the **primary**/source of truth. Accepts SPARQL Update/GSP directly; has no Kafka connector.
+- `write-gateway`: Flask/Waitress HTTP service and the only write entry point. Commits each write to `fuseki-writer` synchronously, then republishes it to Kafka for the replicas.
+- `kafka`: official `apache/kafka:4.3.1`, KRaft single-node mode, JVM heap capped at 256 MiB, container memory capped at 450 MiB. Used here purely as the writer's replication transport.
 - `kafka-init`: creates `rdf-events` and `rdf-events.dlq` explicitly.
-- `fuseki-reader`: scalable Fuseki 6.2.0 + TDB2 + Telicent Jena Fuseki Kafka module 3.1.0.
+- `fuseki-reader`: scalable Fuseki 6.2.0 + TDB2 + Telicent Jena Fuseki Kafka module 3.1.0. Each replica is a read-only **follower** that replays `rdf-events` into its own local TDB2.
 - `nginx-read`: load-balances read-only SPARQL traffic across the Fuseki readers.
-- `locust`: custom `uv`-built image with the Python load test code and Kafka client.
+- `locust`: custom `uv`-built image with the Python load test code; `WriterUser` posts to `write-gateway`, `ReaderUser` queries through `nginx-read`.
 - `kafka-ui`: Kafka topic/consumer inspection UI.
 
 ## RDF And Ontology Model
@@ -97,7 +119,7 @@ After a small run, the graph should contain these kinds of RDF resources:
 - tenant nodes: up to 3 stable IRIs, `demo:tenant-a`, `demo:tenant-b`, `demo:tenant-c`;
 - the named graph node: `demo:graph/load`, used as the N-Quads graph target.
 
-The important scaling behavior is that every reader should converge to the same request count, because every reader consumes the full Kafka topic through its own consumer group. If one reader has fewer request nodes, it is behind Kafka or was misconfigured to share a consumer group.
+The important scaling behavior is that every reader should converge to the same request count as `fuseki-writer`, because every reader consumes the full Kafka topic through its own consumer group. If one reader has fewer request nodes than the writer, it is behind Kafka replication or was misconfigured to share a consumer group. The writer's own count, queried directly, is the ground truth to compare replicas against.
 
 ### What The Read Load Simulates
 
@@ -127,30 +149,33 @@ LIMIT 10
 
 This query answers: "which services are receiving the most requests?" It is a simple analytical query that exercises grouping and aggregation over the RDF graph.
 
-The write load tests Kafka ingestion and TDB2 projection. The read load tests Nginx distribution and Fuseki/TDB2 query performance. Together they show the intended pattern: writes go to Kafka once, every reader builds its own local graph, and reads scale horizontally by adding more Fuseki replicas.
+The write load tests the write-gateway's synchronous commit-to-primary path and TDB2 projection into replicas. The read load tests Nginx distribution and Fuseki/TDB2 query performance. Together they show the intended pattern: writes commit to the primary once, Kafka ships that commit to every reader, and reads scale horizontally by adding more Fuseki replicas.
 
-## Why Kafka Is Configured This Way
+## Why TDB2 Needs A Primary And Kafka Needs To Exist At All
 
-The demo now uses the standard official Kafka image instead of `apache/kafka-native`, but keeps resource usage low:
+TDB2 has no native primary/replica replication: no WAL shipping, no streaming replication, no cluster mode. If a single TDB2 instance is going to be the source of truth, something still has to carry its committed changes out to followers — that's what Kafka is doing here, playing the role a database's own replication log would play if TDB2 had one.
+
+The demo uses the standard official Kafka image instead of `apache/kafka-native`, but keeps resource usage low:
 
 - `KAFKA_HEAP_OPTS=-Xms256m -Xmx256m` caps the JVM heap.
 - `mem_limit: 450m` prevents the Kafka container from growing without bound.
 - KRaft mode avoids ZooKeeper entirely.
 - internal replication factors are set to `1`, which is appropriate for this single-node demo.
-- `KAFKA_NUM_PARTITIONS=1` preserves event ordering, which matters if RDF Patch/delete semantics are introduced later.
+- `KAFKA_NUM_PARTITIONS=1` preserves event ordering, which matters since the writer is a single serial commit stream and readers must apply patches in the same order.
 
-For real production, use a multi-broker Kafka cluster or a managed Kafka service with replication, TLS/SASL, monitoring, backups, and topic retention sized for replay/recovery requirements.
+For real production, use a multi-broker Kafka cluster or a managed Kafka service with replication, TLS/SASL, monitoring, backups, and topic retention sized for replay/recovery requirements. The primary (`fuseki-writer`) is also a single point of failure in this demo — production would need its own failover story (standby TDB2 + promotion, or a managed/clustered triplestore), which is out of scope here.
 
 ## Start The Demo
 
 ```bash
 uv sync
-docker compose build fuseki-reader locust
+docker compose build fuseki-writer write-gateway fuseki-reader locust
 docker compose up -d --scale fuseki-reader=2
 ```
 
 Endpoints:
 
+- Write gateway (the only write entry point): `http://localhost:8081/write`
 - Read-balanced SPARQL endpoint: `http://localhost:8080/ds/sparql`
 - Locust UI: `http://localhost:8089`
 - Kafka UI: `http://localhost:8090`
@@ -160,11 +185,11 @@ Endpoints:
 ## Produce Data Manually
 
 ```bash
-uv run jena-demo-produce --events 10000 --rate 500
+uv run jena-demo-produce --gateway-url http://localhost:8081 --events 10000 --rate 500
 uv run jena-demo-stats --once
 ```
 
-`jena-demo-produce` writes RDF N-Quads events to Kafka with `Content-Type: application/n-quads`. The Fuseki Kafka module consumes those events and applies them to each reader's local TDB2 dataset.
+`jena-demo-produce` posts RDF N-Quads events to the write gateway with `Content-Type: application/n-quads`. The gateway commits each event to `fuseki-writer`'s TDB2 synchronously, then republishes it to Kafka; the Fuseki Kafka module on each reader consumes that topic and applies the same changes to its own local TDB2 dataset.
 
 ## Run Load Tests
 
@@ -182,7 +207,7 @@ uv run locust -f locustfile.py --headless --users 8 --spawn-rate 8 --run-time 20
 
 The Locust test has two user types:
 
-- `WriterUser`: produces RDF events to Kafka.
+- `WriterUser`: posts RDF events to the write gateway (absolute URL, independent of `-H`/`--host`, which only applies to `ReaderUser`).
 - `ReaderUser`: sends SPARQL read queries through Nginx.
 
 ## Scaling Readers
@@ -197,7 +222,7 @@ Every reader gets a unique Kafka `groupId`, derived from its container hostname.
 
 ## Test Results
 
-Environment date: 2026-08-21.
+Environment date: 2026-08-21. **These numbers were measured under the previous architecture, where Locust/`jena-demo-produce` wrote directly to Kafka and no `fuseki-writer`/`write-gateway` existed.** They are kept for historical reference on Kafka/reader throughput; they do not reflect the added write-gateway commit latency described above. Re-run the load test against the current stack for up-to-date numbers.
 
 ### Smoke Test
 
@@ -263,9 +288,9 @@ Result:
 
 ## Did It Scale Correctly?
 
-Yes for read-side horizontal scaling. The demo successfully scaled the Fuseki reader tier from 2 to 4 replicas while keeping Kafka as the single ordered event log. Each reader maintained its own TDB2 database and independently replayed the same Kafka topic. Nginx continued serving reads through one stable endpoint while Docker Compose added replicas.
+Yes for read-side horizontal scaling. The demo scales the Fuseki reader tier from 2 to 4 replicas while `fuseki-writer` remains the single authoritative primary. Each reader maintains its own TDB2 database and independently replays the same Kafka replication topic. Nginx continues serving reads through one stable endpoint while Docker Compose adds replicas.
 
-This pattern is ready to scale the **read path** by adding Fuseki readers. It does not make TDB2 itself distributed, and it does not provide multi-writer TDB2 semantics. Writes should enter through Kafka as RDF events or RDF Patch events, and readers should project those events into local TDB2 stores.
+This pattern scales the **read path** by adding Fuseki readers. It does not make TDB2 itself distributed, and the write path is intentionally single-primary: all writes commit through one `fuseki-writer` instance, which is the guarantee this design trades for (a real source-of-truth DB), at the cost of the primary being a scaling and availability bottleneck for writes.
 
 ## Production Readiness Notes
 
@@ -273,8 +298,9 @@ This demo is production-shaped, but not a complete production deployment.
 
 What is realistic here:
 
+- `fuseki-writer`'s TDB2 is the single source of truth; the write-gateway will not acknowledge a write until it is durably committed there.
 - TDB2 is never shared between containers.
-- Kafka is the replayable source of truth for RDF ingestion.
+- Kafka is the replayable replication transport that ships the primary's committed changes to followers, not the source of truth itself.
 - Each reader uses a unique consumer group.
 - Readers can be scaled horizontally.
 - Read traffic is load-balanced through Nginx.
@@ -284,12 +310,14 @@ What is realistic here:
 
 What must be added for production:
 
+- failover for `fuseki-writer` itself: it is a single point of failure for writes in this demo (standby TDB2 + promotion, or a managed/clustered triplestore);
+- true durability across the commit-then-publish gap: the writer commit and the Kafka publish are two separate steps, not one atomic transaction (a transactional outbox or WAL-tailing approach would close this gap; this demo accepts it and relies on retry + RDF's insert idempotency instead);
 - multi-broker Kafka or managed Kafka, not a single broker;
 - TLS/SASL and ACLs for Kafka;
-- authentication/authorization in front of SPARQL endpoints;
-- persistent storage strategy for every Fuseki reader;
+- authentication/authorization in front of the write gateway and SPARQL endpoints;
+- persistent storage strategy for every Fuseki reader and for the writer;
 - topic retention sized to allow full replay for new replicas;
 - monitoring for consumer lag, DLQ volume, query latency, JVM memory, and disk growth;
-- backup/restore strategy for Kafka and optional TDB2 snapshots;
+- backup/restore strategy for Kafka and TDB2 snapshots (writer and readers);
 - separate write and read network paths;
 - stricter query timeouts and result limits for untrusted clients.

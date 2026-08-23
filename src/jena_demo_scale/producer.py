@@ -4,15 +4,17 @@ import argparse
 import os
 import time
 
-from confluent_kafka import Producer
+import requests
 
 from .rdf import event_nquads
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Produce RDF N-Quads events to Kafka for the Jena demo.")
-    parser.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
-    parser.add_argument("--topic", default=os.getenv("KAFKA_TOPIC", "rdf-events"))
+    parser = argparse.ArgumentParser(
+        description="Produce RDF N-Quads write events through the write gateway, "
+        "which commits them to the writer's TDB2 before replicating via Kafka."
+    )
+    parser.add_argument("--gateway-url", default=os.getenv("GATEWAY_URL", "http://localhost:8081"))
     parser.add_argument("--events", type=int, default=1000)
     parser.add_argument("--rate", type=float, default=100.0, help="Target events per second. Use 0 for max throughput.")
     return parser
@@ -20,42 +22,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    producer = Producer(
-        {
-            "bootstrap.servers": args.bootstrap_servers,
-            "client.id": "jena-demo-producer",
-            "linger.ms": 20,
-            "batch.num.messages": 1000,
-            "compression.type": "zstd",
-            "acks": "all",
-        }
-    )
     delay = 0.0 if args.rate <= 0 else 1.0 / args.rate
     delivered = 0
     started = time.perf_counter()
     errors: list[str] = []
 
-    def on_delivery(err, _msg) -> None:
-        if err is not None:
-            errors.append(str(err))
-
+    session = requests.Session()
     for _index in range(args.events):
-        producer.produce(
-            args.topic,
-            value=event_nquads(),
+        response = session.post(
+            f"{args.gateway_url}/write",
+            data=event_nquads(),
             headers={"Content-Type": "application/n-quads"},
-            on_delivery=on_delivery,
+            timeout=15,
         )
-        delivered += 1
-        producer.poll(0)
+        if response.status_code >= 300:
+            errors.append(f"{response.status_code}: {response.text[:200]}")
+        else:
+            delivered += 1
         if delay:
             time.sleep(delay)
-        if delivered % 1000 == 0:
+        if delivered % 1000 == 0 and delivered:
             elapsed = max(time.perf_counter() - started, 0.001)
             print(f"produced={delivered} rate={delivered / elapsed:.1f}/s")
 
-    producer.flush()
-    if errors:
-        raise RuntimeError(f"Kafka delivery failed: {errors[:3]}")
     elapsed = max(time.perf_counter() - started, 0.001)
     print(f"done produced={delivered} elapsed={elapsed:.2f}s avg_rate={delivered / elapsed:.1f}/s")
+    if errors:
+        raise RuntimeError(f"write gateway failures: {errors[:3]}")

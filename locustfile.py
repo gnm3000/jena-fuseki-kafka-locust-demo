@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from confluent_kafka import Producer
-from locust import HttpUser, between, events, task
+from locust import HttpUser, between, task
 
 from jena_demo_scale.rdf import event_nquads
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "rdf-events")
+WRITE_BASE_URL = os.getenv("WRITE_BASE_URL", "http://write-gateway:8081")
 DATASET_PATH = os.getenv("DATASET_PATH", "/ds")
 
 COUNT_QUERY = """
@@ -37,59 +34,23 @@ LIMIT 10
 """
 
 
-class KafkaProducerUser(HttpUser):
-    abstract = True
-
-    def on_start(self) -> None:
-        self.producer = Producer(
-            {
-                "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
-                "client.id": "locust-jena-demo",
-                "linger.ms": 20,
-                "batch.num.messages": 1000,
-                "compression.type": "zstd",
-                "acks": "all",
-            }
-        )
-
-    def produce_event(self) -> None:
-        started = time.perf_counter()
-        try:
-            self.producer.produce(
-                KAFKA_TOPIC,
-                value=event_nquads(),
-                headers={"Content-Type": "application/n-quads"},
-            )
-            self.producer.poll(0)
-            events.request.fire(
-                request_type="KAFKA",
-                name="produce rdf-events",
-                response_time=(time.perf_counter() - started) * 1000,
-                response_length=0,
-                exception=None,
-                context={},
-            )
-        except Exception as exc:
-            events.request.fire(
-                request_type="KAFKA",
-                name="produce rdf-events",
-                response_time=(time.perf_counter() - started) * 1000,
-                response_length=0,
-                exception=exc,
-                context={},
-            )
-
-    def on_stop(self) -> None:
-        self.producer.flush(5)
-
-
-class WriterUser(KafkaProducerUser):
+class WriterUser(HttpUser):
+    # Locust's --host flag overwrites User.host for every User class, so an
+    # absolute URL is used here to keep writes pinned to the write-gateway
+    # even though --host points ReaderUser at the read-balanced Nginx endpoint.
+    host = WRITE_BASE_URL
     wait_time = between(0.01, 0.05)
     weight = 4
 
     @task
     def write_rdf_event(self) -> None:
-        self.produce_event()
+        self.client.post(
+            f"{WRITE_BASE_URL}/write",
+            data=event_nquads(),
+            headers={"Content-Type": "application/n-quads"},
+            name="write rdf-event (gateway)",
+            timeout=15,
+        )
 
 
 class ReaderUser(HttpUser):
